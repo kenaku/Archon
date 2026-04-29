@@ -28,24 +28,32 @@ mock.module('@archon/paths', () => ({
   validateAppDefaultsPaths: mock(async () => undefined),
 }));
 
-// Mock @archon/core/db modules to throw immediately (avoid DB connection hangs in tests)
+const mockGetOrCreateConversation = mock(async () => {
+  throw new Error('DB not mocked in tests');
+});
+const mockUpdateConversation = mock(async () => {
+  throw new Error('DB not mocked in tests');
+});
+const mockFindCodebaseByRepoUrl = mock(async () => null);
+const mockCreateCodebase = mock(async () => {
+  throw new Error('DB not mocked in tests');
+});
+const mockGetCodebaseCommands = mock(async () => ({}));
+const mockUpdateCodebaseCommands = mock(async () => undefined);
+const mockUpdateCodebase = mock(async () => undefined);
+
+// Mock @archon/core/db modules to throw immediately by default (avoid DB connection hangs in tests)
 mock.module('@archon/core/db/conversations', () => ({
-  getOrCreateConversation: mock(async () => {
-    throw new Error('DB not mocked in tests');
-  }),
-  updateConversation: mock(async () => {
-    throw new Error('DB not mocked in tests');
-  }),
+  getOrCreateConversation: mockGetOrCreateConversation,
+  updateConversation: mockUpdateConversation,
   getConversation: mock(async () => null),
 }));
 mock.module('@archon/core/db/codebases', () => ({
-  findCodebaseByRepoUrl: mock(async () => null),
-  createCodebase: mock(async () => {
-    throw new Error('DB not mocked in tests');
-  }),
-  getCodebaseCommands: mock(async () => ({})),
-  updateCodebaseCommands: mock(async () => undefined),
-  updateCodebase: mock(async () => undefined),
+  findCodebaseByRepoUrl: mockFindCodebaseByRepoUrl,
+  createCodebase: mockCreateCodebase,
+  getCodebaseCommands: mockGetCodebaseCommands,
+  updateCodebaseCommands: mockUpdateCodebaseCommands,
+  updateCodebase: mockUpdateCodebase,
 }));
 
 // Mock @archon/core
@@ -64,15 +72,19 @@ mock.module('@archon/core', () => ({
   },
 }));
 
+const mockSyncRepository = mock(async () => ({ ok: true }));
+const mockAddSafeDirectory = mock(async () => undefined);
+const mockExecFileAsync = mock(async () => ({ stdout: '', stderr: '' }));
+
 // Mock @archon/git
 mock.module('@archon/git', () => ({
   cloneRepository: mock(async () => ({ ok: true })),
-  syncRepository: mock(async () => ({ ok: true })),
-  addSafeDirectory: mock(async () => undefined),
+  syncRepository: mockSyncRepository,
+  addSafeDirectory: mockAddSafeDirectory,
   toRepoPath: mock((p: string) => p),
   toBranchName: mock((b: string) => b),
   isWorktreePath: mock(async () => false),
-  execFileAsync: mock(async () => ({ stdout: '', stderr: '' })),
+  execFileAsync: mockExecFileAsync,
 }));
 
 // Mock @archon/isolation
@@ -158,13 +170,83 @@ function createNotePayload(overrides?: {
   return JSON.stringify(base);
 }
 
+function createMergeRequestPayload(overrides?: {
+  action?: string;
+  state?: 'opened' | 'closed' | 'merged';
+  username?: string;
+  projectPath?: string;
+  iid?: number;
+  projectWebUrl?: string;
+}): string {
+  const projectPath = overrides?.projectPath ?? 'mygroup/myproject';
+  return JSON.stringify({
+    object_kind: 'merge_request',
+    event_type: 'merge_request',
+    user: { username: overrides?.username ?? 'testuser', name: 'Test' },
+    project: {
+      id: 1,
+      path_with_namespace: projectPath,
+      default_branch: 'main',
+      web_url: overrides?.projectWebUrl ?? `https://gitlab.example.com/${projectPath}`,
+      http_url_to_repo: `https://gitlab.example.com/${projectPath}.git`,
+    },
+    object_attributes: {
+      iid: overrides?.iid ?? 1,
+      action: overrides?.action ?? 'open',
+      title: 'Test MR',
+      description: 'Test MR description',
+      state: overrides?.state ?? 'opened',
+      source_branch: 'feature',
+      target_branch: 'main',
+      source_project_id: 1,
+      target_project_id: 1,
+      merge_status: 'can_be_merged',
+    },
+  });
+}
+
+function mockLifecycleRepo(): void {
+  mockCreateCodebase.mockResolvedValue({
+    id: 'codebase-1',
+    name: 'mygroup/myproject',
+    default_cwd: '/tmp/test-workspaces/mygroup/myproject',
+  });
+}
+
 describe('GitLabAdapter', () => {
   beforeEach(() => {
     mockHandleMessage.mockClear();
     mockOnConversationClosed.mockClear();
     mockFetch.mockClear();
+    mockGetOrCreateConversation.mockClear();
+    mockGetOrCreateConversation.mockImplementation(async () => {
+      throw new Error('DB not mocked in tests');
+    });
+    mockUpdateConversation.mockClear();
+    mockUpdateConversation.mockImplementation(async () => {
+      throw new Error('DB not mocked in tests');
+    });
+    mockFindCodebaseByRepoUrl.mockClear();
+    mockFindCodebaseByRepoUrl.mockResolvedValue(null);
+    mockCreateCodebase.mockClear();
+    mockCreateCodebase.mockImplementation(async () => {
+      throw new Error('DB not mocked in tests');
+    });
+    mockGetCodebaseCommands.mockClear();
+    mockGetCodebaseCommands.mockResolvedValue({});
+    mockUpdateCodebaseCommands.mockClear();
+    mockUpdateCodebaseCommands.mockResolvedValue(undefined);
+    mockUpdateCodebase.mockClear();
+    mockUpdateCodebase.mockResolvedValue(undefined);
+    mockSyncRepository.mockClear();
+    mockSyncRepository.mockResolvedValue({ ok: true });
+    mockAddSafeDirectory.mockClear();
+    mockAddSafeDirectory.mockResolvedValue(undefined);
+    mockExecFileAsync.mockClear();
+    mockExecFileAsync.mockResolvedValue({ stdout: '', stderr: '' });
     // Reset env
     delete process.env.GITLAB_ALLOWED_USERS;
+    delete process.env.GITLAB_MR_LIFECYCLE_WORKFLOW;
   });
 
   describe('basic interface', () => {
@@ -342,35 +424,85 @@ describe('GitLabAdapter', () => {
       expect(mockOnConversationClosed).not.toHaveBeenCalled();
     });
 
-    test('ignores MR open events (descriptions are not commands)', async () => {
+    test('ignores MR open events when lifecycle workflow env is not set', async () => {
       const adapter = createAdapter();
-      const payload = JSON.stringify({
-        object_kind: 'merge_request',
-        event_type: 'merge_request',
-        user: { username: 'testuser', name: 'Test' },
-        project: {
-          id: 1,
-          path_with_namespace: 'mygroup/myproject',
-          default_branch: 'main',
-          web_url: 'https://gitlab.example.com/mygroup/myproject',
-          http_url_to_repo: 'https://gitlab.example.com/mygroup/myproject.git',
-        },
-        object_attributes: {
-          iid: 1,
-          action: 'open',
-          title: 'New MR',
-          description: '@archon review this',
-          state: 'opened',
-          source_branch: 'feature',
-          target_branch: 'main',
-          source_project_id: 1,
-          target_project_id: 1,
-          merge_status: 'can_be_merged',
-        },
-      });
+      const payload = createMergeRequestPayload();
       await adapter.handleWebhook(payload, 'test-secret');
       expect(mockHandleMessage).not.toHaveBeenCalled();
       expect(mockOnConversationClosed).not.toHaveBeenCalled();
+      expect(mockExecFileAsync).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('MR lifecycle workflow', () => {
+    test('runs configured workflow for MR open without mention', async () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      mockLifecycleRepo();
+      const adapter = createAdapter();
+
+      await adapter.handleWebhook(
+        createMergeRequestPayload({ action: 'open', iid: 7 }),
+        'test-secret'
+      );
+
+      const workflowCalls = mockExecFileAsync.mock.calls.filter(call => call[0] === 'bun');
+      expect(workflowCalls).toHaveLength(1);
+      const [cmd, args, options] = workflowCalls[0] as [string, string[], { cwd?: string }];
+      expect(cmd).toBe('bun');
+      expect(args).toEqual([
+        'packages/cli/src/cli.ts',
+        '--cwd',
+        '/tmp/test-workspaces/mygroup/myproject',
+        'workflow',
+        'run',
+        'mr-intake-classifier',
+        '--quiet',
+        'https://gitlab.example.com/mygroup/myproject/-/merge_requests/7',
+      ]);
+      expect(options.cwd).toBe(process.cwd());
+      expect(mockHandleMessage).not.toHaveBeenCalled();
+    });
+
+    test('runs configured workflow for MR reopen and update', async () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      mockLifecycleRepo();
+      const adapter = createAdapter();
+
+      await adapter.handleWebhook(createMergeRequestPayload({ action: 'reopen' }), 'test-secret');
+      await adapter.handleWebhook(createMergeRequestPayload({ action: 'update' }), 'test-secret');
+
+      const workflowCalls = mockExecFileAsync.mock.calls.filter(call => call[0] === 'bun');
+      expect(workflowCalls).toHaveLength(2);
+    });
+
+    test('does not run configured workflow for closed MR update', async () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      mockLifecycleRepo();
+      const adapter = createAdapter();
+
+      await adapter.handleWebhook(
+        createMergeRequestPayload({ action: 'update', state: 'closed' }),
+        'test-secret'
+      );
+
+      expect(mockExecFileAsync).not.toHaveBeenCalled();
+    });
+
+    test('does not run lifecycle workflow for note events without mention', async () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      const adapter = createAdapter();
+
+      await adapter.handleWebhook(
+        createNotePayload({
+          noteableType: 'MergeRequest',
+          note: 'regular MR comment',
+          iid: 3,
+        }),
+        'test-secret'
+      );
+
+      expect(mockExecFileAsync).not.toHaveBeenCalled();
+      expect(mockHandleMessage).not.toHaveBeenCalled();
     });
   });
 

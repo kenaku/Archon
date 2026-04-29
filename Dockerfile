@@ -84,6 +84,15 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Install GitLab and Atlassian CLIs used by repository workflows
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://acli.atlassian.com/gpg/public-key.asc | gpg --dearmor -o /etc/apt/keyrings/acli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/acli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/acli-archive-keyring.gpg] https://acli.atlassian.com/linux/deb stable main" | tee /etc/apt/sources.list.d/acli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y glab acli \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary
 # - After install, symlink the Rust binary directly and purge nodejs/npm (~60MB saved)

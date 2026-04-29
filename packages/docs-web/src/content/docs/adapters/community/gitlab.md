@@ -95,6 +95,16 @@ GITLAB_ALLOWED_USERS=alice,bob
 GITLAB_BOT_MENTION=archon
 ```
 
+Optional merge request lifecycle workflow:
+
+```ini
+GITLAB_MR_LIFECYCLE_WORKFLOW=mr-intake-classifier
+```
+
+When this value is set, Archon runs that workflow automatically for GitLab merge request
+`open`, `reopen`, and `update` events while the merge request is open. The workflow receives
+the merge request URL as its input. Leave the variable unset or empty to disable this behavior.
+
 See the [full environment variable reference](/reference/configuration/) for details.
 
 ## Usage
@@ -126,7 +136,14 @@ Mention your bot in issue or MR comments:
 | **Note Hook** (comment with @mention) | Triggers AI conversation |
 | **Issue Hook** (close) | Cleans up isolation environment |
 | **MR Hook** (close/merge) | Cleans up isolation environment |
-| Issue/MR opened | Ignored (descriptions are not commands) |
+| **MR Hook** (open/reopen/update) | Runs `GITLAB_MR_LIFECYCLE_WORKFLOW` when configured |
+| Issue opened | Ignored (descriptions are not commands) |
+
+:::note
+GitLab comments are `Note Hook` events, not merge request `update` events. A regular MR
+comment does not run `GITLAB_MR_LIFECYCLE_WORKFLOW`; comments still require an explicit
+`@archon` mention.
+:::
 
 ## Adding Additional Projects
 
