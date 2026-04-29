@@ -29,7 +29,12 @@ import * as db from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
 import { parseAllowedUsers, isGitLabUserAuthorized, verifyWebhookToken } from './auth';
 import { splitIntoParagraphChunks } from '../../../utils/message-splitting';
-import type { GitLabWebhookEvent, GitLabIssue, GitLabMergeRequest } from './types';
+import type {
+  GitLabWebhookEvent,
+  GitLabIssue,
+  GitLabMergeRequest,
+  GitLabMergeRequestEvent,
+} from './types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -42,6 +47,18 @@ const MAX_LENGTH = 65000; // Practical limit for GitLab notes
 
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
+
+interface ParsedGitLabEvent {
+  projectPath: string;
+  iid: number;
+  comment: string;
+  eventType: 'note' | 'issue' | 'merge_request';
+  isMR: boolean;
+  issue?: GitLabIssue;
+  mergeRequest?: GitLabMergeRequest;
+  isCloseEvent?: boolean;
+  isMerged?: boolean;
+}
 
 export class GitLabAdapter implements IPlatformAdapter {
   private readonly gitlabUrl: string;
@@ -279,17 +296,7 @@ export class GitLabAdapter implements IPlatformAdapter {
   // Event parsing
   // ---------------------------------------------------------------------------
 
-  private parseEvent(event: GitLabWebhookEvent): {
-    projectPath: string;
-    iid: number;
-    comment: string;
-    eventType: 'note' | 'issue' | 'merge_request';
-    isMR: boolean;
-    issue?: GitLabIssue;
-    mergeRequest?: GitLabMergeRequest;
-    isCloseEvent?: boolean;
-    isMerged?: boolean;
-  } | null {
+  private parseEvent(event: GitLabWebhookEvent): ParsedGitLabEvent | null {
     const projectPath = event.project.path_with_namespace;
 
     // Issue closed
@@ -318,6 +325,14 @@ export class GitLabAdapter implements IPlatformAdapter {
           isMerged: action === 'merge',
         };
       }
+
+      return {
+        projectPath,
+        iid: event.object_attributes.iid,
+        comment: '',
+        eventType: 'merge_request',
+        isMR: true,
+      };
     }
 
     // Note (comment) on issue or MR
@@ -594,6 +609,101 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
     }
   }
 
+  private shouldTriggerMergeRequestLifecycleWorkflow(event: GitLabMergeRequestEvent): boolean {
+    const workflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
+    if (!workflowName) return false;
+
+    const action = event.object_attributes.action;
+    if (action !== 'open' && action !== 'reopen' && action !== 'update') return false;
+
+    return event.object_attributes.state === 'opened';
+  }
+
+  private async handleMergeRequestLifecycleWorkflow(
+    event: GitLabMergeRequestEvent,
+    parsed: ParsedGitLabEvent
+  ): Promise<void> {
+    const workflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
+    if (!workflowName) return;
+    if (!this.shouldTriggerMergeRequestLifecycleWorkflow(event)) return;
+
+    const { projectPath, iid } = parsed;
+    const conversationId = `gitlab-mr-lifecycle:${projectPath}!${String(iid)}`;
+    const mrUrl = `${event.project.web_url.replace(/\/+$/, '')}/-/merge_requests/${String(iid)}`;
+
+    getLog().info(
+      {
+        projectPath,
+        iid,
+        action: event.object_attributes.action,
+        workflowName,
+      },
+      'gitlab.mr_lifecycle_workflow_received'
+    );
+
+    await this.lockManager.acquireLock(conversationId, async () => {
+      try {
+        const {
+          codebase,
+          repoPath,
+          isNew: isNewCodebase,
+        } = await this.getOrCreateCodebaseForRepo(projectPath);
+
+        await this.ensureRepoReady(
+          projectPath,
+          event.project.default_branch,
+          repoPath,
+          isNewCodebase
+        );
+
+        if (isNewCodebase) {
+          await this.autoDetectAndLoadCommands(repoPath, codebase.id);
+        }
+
+        getLog().info(
+          { projectPath, iid, workflowName, mrUrl },
+          'gitlab.mr_lifecycle_workflow_started'
+        );
+
+        const result = await execFileAsync(
+          'bun',
+          [
+            'packages/cli/src/cli.ts',
+            '--cwd',
+            repoPath,
+            'workflow',
+            'run',
+            workflowName,
+            '--quiet',
+            mrUrl,
+          ],
+          {
+            cwd: process.cwd(),
+            timeout: 15 * 60 * 1000,
+            maxBuffer: 10 * 1024 * 1024,
+            env: process.env,
+          }
+        );
+
+        getLog().info(
+          {
+            projectPath,
+            iid,
+            workflowName,
+            stdoutLength: result.stdout.length,
+            stderrLength: result.stderr.length,
+          },
+          'gitlab.mr_lifecycle_workflow_completed'
+        );
+      } catch (error) {
+        getLog().error(
+          { err: toError(error), projectPath, iid, workflowName },
+          'gitlab.mr_lifecycle_workflow_failed'
+        );
+      }
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Webhook handler
   // ---------------------------------------------------------------------------
@@ -648,7 +758,14 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
       return;
     }
 
-    // 5. Self-trigger prevention
+    // 5. Optional MR lifecycle workflow for open/reopen/update events.
+    // Note events still require an explicit @mention below.
+    if (event.object_kind === 'merge_request') {
+      await this.handleMergeRequestLifecycleWorkflow(event, parsed);
+      return;
+    }
+
+    // 6. Self-trigger prevention
     if (comment.includes(BOT_RESPONSE_MARKER)) {
       getLog().debug({ commentAuthor: event.user?.username }, 'gitlab.ignoring_marked_comment');
       return;
@@ -658,14 +775,14 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
       return;
     }
 
-    // 6. Check @mention
+    // 7. Check @mention
     if (!this.hasMention(comment)) return;
 
     getLog().info({ eventType, projectPath, iid, isMR }, 'gitlab.webhook_processing');
 
-    // Steps 7-13 wrapped in try-catch so user gets error feedback on setup failures
+    // Steps 8-14 wrapped in try-catch so user gets error feedback on setup failures
     try {
-      // 7. Conversation + codebase setup
+      // 8. Conversation + codebase setup
       const conversationId = this.buildConversationId(projectPath, iid, isMR);
       const existingConv = await db.getOrCreateConversation('gitlab', conversationId);
       const isNewConversation = !existingConv.codebase_id;
@@ -694,18 +811,18 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         }
       }
 
-      // 8. Get default branch
+      // 9. Get default branch
       const defaultBranch = event.project.default_branch;
 
-      // 9. Ensure repo ready
+      // 10. Ensure repo ready
       await this.ensureRepoReady(projectPath, defaultBranch, repoPath, isNewCodebase);
 
-      // 10. Auto-load commands
+      // 11. Auto-load commands
       if (isNewCodebase) {
         await this.autoDetectAndLoadCommands(repoPath, codebase.id);
       }
 
-      // 11. Isolation hints
+      // 12. Isolation hints
       const isolationHints: IsolationHints = {
         workflowType: isMR ? 'pr' : 'issue',
         workflowId: String(iid),
@@ -725,7 +842,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         );
       }
 
-      // 12. Build message with context
+      // 13. Build message with context
       const strippedComment = this.stripMention(comment);
       let finalMessage = strippedComment;
       let contextToAppend: string | undefined;
@@ -751,7 +868,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         }
       }
 
-      // 13. Thread context + dispatch
+      // 14. Thread context + dispatch
       const commentHistory = await this.fetchCommentHistory(projectPath, iid, isMR);
       const threadContext = commentHistory.length > 0 ? commentHistory.join('\n') : undefined;
       getLog().debug(
