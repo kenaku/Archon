@@ -93,6 +93,10 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get install -y glab acli \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv for Python workflow script nodes (`runtime: uv`)
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv --version
+
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary
 # - After install, symlink the Rust binary directly and purge nodejs/npm (~60MB saved)
