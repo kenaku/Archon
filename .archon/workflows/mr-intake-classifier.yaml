@@ -1,0 +1,32 @@
+name: mr-intake-classifier
+description: >-
+  Use when: quickly classify any GitLab merge request from compact GitLab API
+  facts for a reviewer-facing first-pass summary. NOT for full evidence review,
+  bug proof, or posting comments to GitLab.
+provider: claude
+model: claude-haiku-4-5
+worktree:
+  enabled: false
+nodes:
+  - id: collect_facts
+    bash: |
+      set -eu
+      ARTIFACTS_DIR="$ARTIFACTS_DIR" python3 .archon/scripts/mr-intake-facts.py "$ARGUMENTS"
+    timeout: 120000
+
+  - id: classify
+    command: mr-intake-classify
+    provider: claude
+    model: claude-haiku-4-5
+    context: fresh
+    allowed_tools: [Read, Write]
+    depends_on:
+      - collect_facts
+
+  - id: post_gitlab_comment
+    bash: |
+      set -eu
+      ARTIFACTS_DIR="$ARTIFACTS_DIR" python3 .archon/scripts/mr-intake-post-gitlab.py "$ARGUMENTS"
+    depends_on:
+      - classify
+    timeout: 120000
