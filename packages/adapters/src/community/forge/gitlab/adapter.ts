@@ -48,18 +48,6 @@ const MAX_LENGTH = 65000; // Practical limit for GitLab notes
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
 
-interface ParsedGitLabEvent {
-  projectPath: string;
-  iid: number;
-  comment: string;
-  eventType: 'note' | 'issue' | 'merge_request';
-  isMR: boolean;
-  issue?: GitLabIssue;
-  mergeRequest?: GitLabMergeRequest;
-  isCloseEvent?: boolean;
-  isMerged?: boolean;
-}
-
 export class GitLabAdapter implements IPlatformAdapter {
   private readonly gitlabUrl: string;
   private readonly token: string;
@@ -296,7 +284,17 @@ export class GitLabAdapter implements IPlatformAdapter {
   // Event parsing
   // ---------------------------------------------------------------------------
 
-  private parseEvent(event: GitLabWebhookEvent): ParsedGitLabEvent | null {
+  private parseEvent(event: GitLabWebhookEvent): {
+    projectPath: string;
+    iid: number;
+    comment: string;
+    eventType: 'note' | 'issue' | 'merge_request';
+    isMR: boolean;
+    issue?: GitLabIssue;
+    mergeRequest?: GitLabMergeRequest;
+    isCloseEvent?: boolean;
+    isMerged?: boolean;
+  } | null {
     const projectPath = event.project.path_with_namespace;
 
     // Issue closed
@@ -609,25 +607,47 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
     }
   }
 
+  private hasMergeRequestCodeChange(event: GitLabMergeRequestEvent): boolean {
+    const oldrev = event.object_attributes.oldrev ?? event.changes?.oldrev?.previous ?? null;
+    const current =
+      event.object_attributes.last_commit?.id ??
+      event.changes?.oldrev?.current ??
+      event.changes?.last_commit?.current?.id ??
+      null;
+    const previous = event.changes?.last_commit?.previous?.id ?? oldrev;
+
+    if (!current || !previous) return false;
+    return current !== previous;
+  }
+
   private shouldTriggerMergeRequestLifecycleWorkflow(event: GitLabMergeRequestEvent): boolean {
     const workflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
     if (!workflowName) return false;
+    if (event.object_attributes.state !== 'opened') return false;
 
     const action = event.object_attributes.action;
-    if (action !== 'open' && action !== 'reopen' && action !== 'update') return false;
+    if (action === 'open' || action === 'reopen') return true;
+    if (action === 'update') return this.hasMergeRequestCodeChange(event);
 
-    return event.object_attributes.state === 'opened';
+    return false;
   }
 
   private async handleMergeRequestLifecycleWorkflow(
     event: GitLabMergeRequestEvent,
-    parsed: ParsedGitLabEvent
+    parsed: NonNullable<ReturnType<GitLabAdapter['parseEvent']>>
   ): Promise<void> {
     const workflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
     if (!workflowName) return;
-    if (!this.shouldTriggerMergeRequestLifecycleWorkflow(event)) return;
 
+    const action = event.object_attributes.action;
+    const shouldRun = this.shouldTriggerMergeRequestLifecycleWorkflow(event);
     const { projectPath, iid } = parsed;
+
+    if (!shouldRun) {
+      getLog().debug({ projectPath, iid, action }, 'gitlab.mr_lifecycle_workflow_skipped');
+      return;
+    }
+
     const conversationId = `gitlab-mr-lifecycle:${projectPath}!${String(iid)}`;
     const mrUrl = `${event.project.web_url.replace(/\/+$/, '')}/-/merge_requests/${String(iid)}`;
 
@@ -635,7 +655,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
       {
         projectPath,
         iid,
-        action: event.object_attributes.action,
+        action,
         workflowName,
       },
       'gitlab.mr_lifecycle_workflow_received'
@@ -665,23 +685,30 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
           'gitlab.mr_lifecycle_workflow_started'
         );
 
-        const result = await execFileAsync(
-          'bun',
-          [
-            'packages/cli/src/cli.ts',
-            '--cwd',
-            repoPath,
-            'workflow',
-            'run',
-            workflowName,
-            '--quiet',
-            mrUrl,
-          ],
+        const mrConversationId = `${projectPath}!${String(iid)}`;
+        const conversation = await db.getOrCreateConversation('gitlab', mrConversationId);
+        await db.updateConversation(conversation.id, {
+          codebase_id: codebase.id,
+          cwd: repoPath,
+        });
+        const lifecyclePlatform: IPlatformAdapter = {
+          sendMessage: async () => undefined,
+          ensureThread: async originalConversationId => originalConversationId,
+          getStreamingMode: () => this.getStreamingMode(),
+          getPlatformType: () => this.getPlatformType(),
+          start: async () => undefined,
+          stop: () => undefined,
+        };
+
+        await handleMessage(
+          lifecyclePlatform,
+          mrConversationId,
+          `/workflow run ${workflowName} ${mrUrl}`,
           {
-            cwd: process.cwd(),
-            timeout: 15 * 60 * 1000,
-            maxBuffer: 10 * 1024 * 1024,
-            env: process.env,
+            isolationHints: {
+              workflowType: 'pr',
+              workflowId: String(iid),
+            },
           }
         );
 
@@ -690,8 +717,6 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
             projectPath,
             iid,
             workflowName,
-            stdoutLength: result.stdout.length,
-            stderrLength: result.stderr.length,
           },
           'gitlab.mr_lifecycle_workflow_completed'
         );
@@ -758,14 +783,14 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
       return;
     }
 
-    // 5. Optional MR lifecycle workflow for open/reopen/update events.
+    // MR lifecycle events use a cheap preflight before any conversation/workflow rows exist.
     // Note events still require an explicit @mention below.
     if (event.object_kind === 'merge_request') {
       await this.handleMergeRequestLifecycleWorkflow(event, parsed);
       return;
     }
 
-    // 6. Self-trigger prevention
+    // 5. Self-trigger prevention
     if (comment.includes(BOT_RESPONSE_MARKER)) {
       getLog().debug({ commentAuthor: event.user?.username }, 'gitlab.ignoring_marked_comment');
       return;
@@ -775,14 +800,14 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
       return;
     }
 
-    // 7. Check @mention
+    // 6. Check @mention
     if (!this.hasMention(comment)) return;
 
     getLog().info({ eventType, projectPath, iid, isMR }, 'gitlab.webhook_processing');
 
-    // Steps 8-14 wrapped in try-catch so user gets error feedback on setup failures
+    // Steps 7-13 wrapped in try-catch so user gets error feedback on setup failures
     try {
-      // 8. Conversation + codebase setup
+      // 7. Conversation + codebase setup
       const conversationId = this.buildConversationId(projectPath, iid, isMR);
       const existingConv = await db.getOrCreateConversation('gitlab', conversationId);
       const isNewConversation = !existingConv.codebase_id;
@@ -811,18 +836,18 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         }
       }
 
-      // 9. Get default branch
+      // 8. Get default branch
       const defaultBranch = event.project.default_branch;
 
-      // 10. Ensure repo ready
+      // 9. Ensure repo ready
       await this.ensureRepoReady(projectPath, defaultBranch, repoPath, isNewCodebase);
 
-      // 11. Auto-load commands
+      // 10. Auto-load commands
       if (isNewCodebase) {
         await this.autoDetectAndLoadCommands(repoPath, codebase.id);
       }
 
-      // 12. Isolation hints
+      // 11. Isolation hints
       const isolationHints: IsolationHints = {
         workflowType: isMR ? 'pr' : 'issue',
         workflowId: String(iid),
@@ -842,7 +867,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         );
       }
 
-      // 13. Build message with context
+      // 12. Build message with context
       const strippedComment = this.stripMention(comment);
       let finalMessage = strippedComment;
       let contextToAppend: string | undefined;
@@ -868,7 +893,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         }
       }
 
-      // 14. Thread context + dispatch
+      // 13. Thread context + dispatch
       const commentHistory = await this.fetchCommentHistory(projectPath, iid, isMR);
       const threadContext = commentHistory.length > 0 ? commentHistory.join('\n') : undefined;
       getLog().debug(

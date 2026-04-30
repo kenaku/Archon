@@ -174,8 +174,12 @@ COPY packages/workflows/ ./packages/workflows/
 # Copy pre-built web UI from build stage
 COPY --from=web-build /app/packages/web/dist/ ./packages/web/dist/
 
-# Copy config, migrations, and bundled defaults
-COPY .archon/ ./.archon/
+# Runtime workflow assets are mounted at /.archon in Adapty deployments.
+# Keep app defaults paths present for source-mode startup without requiring
+# the platform repository to track .archon contents.
+RUN mkdir -p ./.archon/commands/defaults ./.archon/workflows/defaults
+
+# Copy config and migrations
 COPY migrations/ ./migrations/
 COPY tsconfig*.json ./
 
