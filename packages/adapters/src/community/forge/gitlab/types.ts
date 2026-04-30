@@ -93,6 +93,8 @@ export interface GitLabMergeRequestAttributes {
   source_project_id: number;
   target_project_id: number;
   merge_status: string;
+  oldrev?: string | null;
+  last_commit?: { id?: string | null } | null;
 }
 
 export interface GitLabMergeRequestEvent {
@@ -101,6 +103,13 @@ export interface GitLabMergeRequestEvent {
   user: GitLabUser;
   project: GitLabProject;
   object_attributes: GitLabMergeRequestAttributes;
+  changes?: {
+    oldrev?: { previous?: string | null; current?: string | null };
+    last_commit?: {
+      previous?: { id?: string | null } | null;
+      current?: { id?: string | null } | null;
+    };
+  };
 }
 
 // --- Discriminated union ---

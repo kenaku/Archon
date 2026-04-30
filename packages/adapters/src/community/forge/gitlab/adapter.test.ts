@@ -42,7 +42,7 @@ const mockGetCodebaseCommands = mock(async () => ({}));
 const mockUpdateCodebaseCommands = mock(async () => undefined);
 const mockUpdateCodebase = mock(async () => undefined);
 
-// Mock @archon/core/db modules to throw immediately by default (avoid DB connection hangs in tests)
+// Mock @archon/core/db modules to throw immediately (avoid DB connection hangs in tests)
 mock.module('@archon/core/db/conversations', () => ({
   getOrCreateConversation: mockGetOrCreateConversation,
   updateConversation: mockUpdateConversation,
@@ -72,15 +72,12 @@ mock.module('@archon/core', () => ({
   },
 }));
 
-const mockSyncRepository = mock(async () => ({ ok: true }));
-const mockAddSafeDirectory = mock(async () => undefined);
-const mockExecFileAsync = mock(async () => ({ stdout: '', stderr: '' }));
-
 // Mock @archon/git
+const mockExecFileAsync = mock(async () => ({ stdout: '', stderr: '' }));
 mock.module('@archon/git', () => ({
   cloneRepository: mock(async () => ({ ok: true })),
-  syncRepository: mockSyncRepository,
-  addSafeDirectory: mockAddSafeDirectory,
+  syncRepository: mock(async () => ({ ok: true })),
+  addSafeDirectory: mock(async () => undefined),
   toRepoPath: mock((p: string) => p),
   toBranchName: mock((b: string) => b),
   isWorktreePath: mock(async () => false),
@@ -177,9 +174,11 @@ function createMergeRequestPayload(overrides?: {
   projectPath?: string;
   iid?: number;
   projectWebUrl?: string;
+  oldrev?: string | null;
+  lastCommitId?: string | null;
 }): string {
   const projectPath = overrides?.projectPath ?? 'mygroup/myproject';
-  return JSON.stringify({
+  const payload = {
     object_kind: 'merge_request',
     event_type: 'merge_request',
     user: { username: overrides?.username ?? 'testuser', name: 'Test' },
@@ -201,23 +200,18 @@ function createMergeRequestPayload(overrides?: {
       source_project_id: 1,
       target_project_id: 1,
       merge_status: 'can_be_merged',
+      oldrev: overrides?.oldrev,
+      last_commit:
+        overrides?.lastCommitId === undefined ? undefined : { id: overrides.lastCommitId },
     },
-  });
-}
-
-function mockLifecycleRepo(): void {
-  mockCreateCodebase.mockResolvedValue({
-    id: 'codebase-1',
-    name: 'mygroup/myproject',
-    default_cwd: '/tmp/test-workspaces/mygroup/myproject',
-  });
+  };
+  return JSON.stringify(payload);
 }
 
 describe('GitLabAdapter', () => {
   beforeEach(() => {
     mockHandleMessage.mockClear();
     mockOnConversationClosed.mockClear();
-    mockFetch.mockClear();
     mockGetOrCreateConversation.mockClear();
     mockGetOrCreateConversation.mockImplementation(async () => {
       throw new Error('DB not mocked in tests');
@@ -238,12 +232,9 @@ describe('GitLabAdapter', () => {
     mockUpdateCodebaseCommands.mockResolvedValue(undefined);
     mockUpdateCodebase.mockClear();
     mockUpdateCodebase.mockResolvedValue(undefined);
-    mockSyncRepository.mockClear();
-    mockSyncRepository.mockResolvedValue({ ok: true });
-    mockAddSafeDirectory.mockClear();
-    mockAddSafeDirectory.mockResolvedValue(undefined);
     mockExecFileAsync.mockClear();
     mockExecFileAsync.mockResolvedValue({ stdout: '', stderr: '' });
+    mockFetch.mockClear();
     // Reset env
     delete process.env.GITLAB_ALLOWED_USERS;
     delete process.env.GITLAB_MR_LIFECYCLE_WORKFLOW;
@@ -424,20 +415,146 @@ describe('GitLabAdapter', () => {
       expect(mockOnConversationClosed).not.toHaveBeenCalled();
     });
 
-    test('ignores MR open events when lifecycle workflow env is not set', async () => {
+    test('ignores MR open events (descriptions are not commands)', async () => {
       const adapter = createAdapter();
-      const payload = createMergeRequestPayload();
+      const payload = JSON.stringify({
+        object_kind: 'merge_request',
+        event_type: 'merge_request',
+        user: { username: 'testuser', name: 'Test' },
+        project: {
+          id: 1,
+          path_with_namespace: 'mygroup/myproject',
+          default_branch: 'main',
+          web_url: 'https://gitlab.example.com/mygroup/myproject',
+          http_url_to_repo: 'https://gitlab.example.com/mygroup/myproject.git',
+        },
+        object_attributes: {
+          iid: 1,
+          action: 'open',
+          title: 'New MR',
+          description: '@archon review this',
+          state: 'opened',
+          source_branch: 'feature',
+          target_branch: 'main',
+          source_project_id: 1,
+          target_project_id: 1,
+          merge_status: 'can_be_merged',
+        },
+      });
       await adapter.handleWebhook(payload, 'test-secret');
       expect(mockHandleMessage).not.toHaveBeenCalled();
       expect(mockOnConversationClosed).not.toHaveBeenCalled();
-      expect(mockExecFileAsync).not.toHaveBeenCalled();
     });
   });
 
-  describe('MR lifecycle workflow', () => {
-    test('runs configured workflow for MR open without mention', async () => {
+  describe('MR lifecycle preflight', () => {
+    const buildEvent = (overrides?: Record<string, unknown>) => ({
+      object_kind: 'merge_request' as const,
+      event_type: 'merge_request' as const,
+      user: { username: 'testuser', name: 'Test' },
+      project: {
+        id: 1,
+        path_with_namespace: 'mygroup/myproject',
+        default_branch: 'main',
+        web_url: 'https://gitlab.example.com/mygroup/myproject',
+        http_url_to_repo: 'https://gitlab.example.com/mygroup/myproject.git',
+      },
+      object_attributes: {
+        iid: 1,
+        action: 'update',
+        title: 'MR',
+        description: null,
+        state: 'opened',
+        source_branch: 'feature',
+        target_branch: 'main',
+        source_project_id: 1,
+        target_project_id: 1,
+        merge_status: 'can_be_merged',
+      },
+      ...overrides,
+    });
+
+    test('skips update events that do not change code', () => {
       process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
-      mockLifecycleRepo();
+      const adapter = createAdapter();
+      const shouldTrigger = (
+        adapter as unknown as {
+          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+        }
+      ).shouldTriggerMergeRequestLifecycleWorkflow;
+
+      expect(shouldTrigger.call(adapter, buildEvent())).toBe(false);
+    });
+
+    test('runs update events when MR head changes', () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      const adapter = createAdapter();
+      const shouldTrigger = (
+        adapter as unknown as {
+          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+        }
+      ).shouldTriggerMergeRequestLifecycleWorkflow;
+
+      expect(
+        shouldTrigger.call(
+          adapter,
+          buildEvent({
+            object_attributes: {
+              ...buildEvent().object_attributes,
+              oldrev: 'old-sha',
+              last_commit: { id: 'new-sha' },
+            },
+          })
+        )
+      ).toBe(true);
+    });
+
+    test('runs open and reopen events', () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      const adapter = createAdapter();
+      const shouldTrigger = (
+        adapter as unknown as {
+          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+        }
+      ).shouldTriggerMergeRequestLifecycleWorkflow;
+
+      expect(
+        shouldTrigger.call(
+          adapter,
+          buildEvent({ object_attributes: { ...buildEvent().object_attributes, action: 'open' } })
+        )
+      ).toBe(true);
+      expect(
+        shouldTrigger.call(
+          adapter,
+          buildEvent({ object_attributes: { ...buildEvent().object_attributes, action: 'reopen' } })
+        )
+      ).toBe(true);
+    });
+
+    test('dispatches lifecycle workflow through orchestrator command path', async () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      mockFindCodebaseByRepoUrl.mockResolvedValue({
+        id: 'codebase-1',
+        name: 'mygroup/myproject',
+        default_cwd: process.cwd(),
+      });
+      mockGetOrCreateConversation.mockResolvedValue({
+        id: 'conversation-1',
+        platform_type: 'gitlab',
+        platform_conversation_id: 'mygroup/myproject!7',
+        codebase_id: null,
+        cwd: null,
+        isolation_env_id: null,
+        ai_assistant_type: 'claude',
+        title: null,
+        hidden: false,
+        deleted_at: null,
+        last_activity_at: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+      mockUpdateConversation.mockResolvedValue(undefined);
       const adapter = createAdapter();
 
       await adapter.handleWebhook(
@@ -445,64 +562,29 @@ describe('GitLabAdapter', () => {
         'test-secret'
       );
 
-      const workflowCalls = mockExecFileAsync.mock.calls.filter(call => call[0] === 'bun');
-      expect(workflowCalls).toHaveLength(1);
-      const [cmd, args, options] = workflowCalls[0] as [string, string[], { cwd?: string }];
-      expect(cmd).toBe('bun');
-      expect(args).toEqual([
-        'packages/cli/src/cli.ts',
-        '--cwd',
-        '/tmp/test-workspaces/mygroup/myproject',
-        'workflow',
-        'run',
-        'mr-intake-classifier',
-        '--quiet',
-        'https://gitlab.example.com/mygroup/myproject/-/merge_requests/7',
-      ]);
-      expect(options.cwd).toBe(process.cwd());
-      expect(mockHandleMessage).not.toHaveBeenCalled();
-    });
-
-    test('runs configured workflow for MR reopen and update', async () => {
-      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
-      mockLifecycleRepo();
-      const adapter = createAdapter();
-
-      await adapter.handleWebhook(createMergeRequestPayload({ action: 'reopen' }), 'test-secret');
-      await adapter.handleWebhook(createMergeRequestPayload({ action: 'update' }), 'test-secret');
-
-      const workflowCalls = mockExecFileAsync.mock.calls.filter(call => call[0] === 'bun');
-      expect(workflowCalls).toHaveLength(2);
-    });
-
-    test('does not run configured workflow for closed MR update', async () => {
-      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
-      mockLifecycleRepo();
-      const adapter = createAdapter();
-
-      await adapter.handleWebhook(
-        createMergeRequestPayload({ action: 'update', state: 'closed' }),
-        'test-secret'
-      );
-
-      expect(mockExecFileAsync).not.toHaveBeenCalled();
-    });
-
-    test('does not run lifecycle workflow for note events without mention', async () => {
-      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
-      const adapter = createAdapter();
-
-      await adapter.handleWebhook(
-        createNotePayload({
-          noteableType: 'MergeRequest',
-          note: 'regular MR comment',
-          iid: 3,
+      expect(mockUpdateConversation).toHaveBeenCalledWith('conversation-1', {
+        codebase_id: 'codebase-1',
+        cwd: process.cwd(),
+      });
+      expect(mockHandleMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sendMessage: expect.any(Function),
+          getPlatformType: expect.any(Function),
         }),
-        'test-secret'
+        'mygroup/myproject!7',
+        '/workflow run mr-intake-classifier https://gitlab.example.com/mygroup/myproject/-/merge_requests/7',
+        {
+          isolationHints: {
+            workflowType: 'pr',
+            workflowId: '7',
+          },
+        }
       );
-
-      expect(mockExecFileAsync).not.toHaveBeenCalled();
-      expect(mockHandleMessage).not.toHaveBeenCalled();
+      expect(mockExecFileAsync).not.toHaveBeenCalledWith(
+        'bun',
+        expect.any(Array),
+        expect.anything()
+      );
     });
   });
 
