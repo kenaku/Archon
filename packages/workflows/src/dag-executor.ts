@@ -38,6 +38,8 @@ import type {
   TriggerRule,
   WorkflowRun,
   EffortLevel,
+  ModelReasoningEffort,
+  WebSearchMode,
   ThinkingConfig,
   SandboxSettings,
 } from './schemas';
@@ -149,10 +151,37 @@ export async function loadConfiguredMcpServerNames(
 /** Workflow-level Claude SDK options — per-node overrides take precedence via ?? */
 interface WorkflowLevelOptions {
   effort?: EffortLevel;
+  modelReasoningEffort?: ModelReasoningEffort;
+  webSearchMode?: WebSearchMode;
+  additionalDirectories?: string[];
   thinking?: ThinkingConfig;
   fallbackModel?: string;
   betas?: string[];
   sandbox?: SandboxSettings;
+}
+
+function buildAssistantConfig(
+  provider: string,
+  config: WorkflowConfig,
+  workflowLevelOptions?: WorkflowLevelOptions
+): Record<string, unknown> {
+  const assistantConfig: Record<string, unknown> = { ...(config.assistants[provider] ?? {}) };
+
+  if (provider !== 'codex' || !workflowLevelOptions) {
+    return assistantConfig;
+  }
+
+  if (workflowLevelOptions.modelReasoningEffort !== undefined) {
+    assistantConfig.modelReasoningEffort = workflowLevelOptions.modelReasoningEffort;
+  }
+  if (workflowLevelOptions.webSearchMode !== undefined) {
+    assistantConfig.webSearchMode = workflowLevelOptions.webSearchMode;
+  }
+  if (workflowLevelOptions.additionalDirectories !== undefined) {
+    assistantConfig.additionalDirectories = workflowLevelOptions.additionalDirectories;
+  }
+
+  return assistantConfig;
 }
 
 /** Internal node execution result — extends NodeOutput with cost data for aggregation. */
@@ -460,7 +489,7 @@ async function resolveNodeProviderAndModel(
   };
 
   // Pass assistantConfig from config — provider parses internally
-  const assistantConfig = config.assistants[provider] ?? {};
+  const assistantConfig = buildAssistantConfig(provider, config, workflowLevelOptions);
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -1704,7 +1733,7 @@ function buildLoopNodeOptions(
   if (config.envVars && Object.keys(config.envVars).length > 0) {
     options.env = config.envVars;
   }
-  options.assistantConfig = config.assistants[provider] ?? {};
+  options.assistantConfig = buildAssistantConfig(provider, config, workflowLevelOptions);
   // Pass workflow-level options as nodeConfig so providers can apply them
   if (workflowLevelOptions) {
     options.nodeConfig = {
@@ -2506,6 +2535,9 @@ export async function executeDagWorkflow(
   const dagStartTime = Date.now();
   const workflowLevelOptions = {
     effort: workflow.effort,
+    modelReasoningEffort: workflow.modelReasoningEffort,
+    webSearchMode: workflow.webSearchMode,
+    additionalDirectories: workflow.additionalDirectories,
     thinking: workflow.thinking,
     fallbackModel: workflow.fallbackModel,
     betas: workflow.betas,

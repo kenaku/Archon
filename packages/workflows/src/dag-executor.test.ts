@@ -5717,6 +5717,93 @@ describe('executeDagWorkflow -- Claude SDK advanced options', () => {
     expect(nodeConfig?.effort).toBe('max');
   });
 
+  it('forwards workflow-level Codex options to Codex command nodes', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-options-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'codex' }],
+        modelReasoningEffort: 'medium',
+        webSearchMode: 'disabled',
+        additionalDirectories: ['/workspace/extra'],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.assistantConfig).toEqual(
+      expect.objectContaining({
+        modelReasoningEffort: 'medium',
+        webSearchMode: 'disabled',
+        additionalDirectories: ['/workspace/extra'],
+      })
+    );
+  });
+
+  it('forwards workflow-level Codex options to Codex loop nodes', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'Done. <promise>COMPLETE</promise>' };
+      yield { type: 'result', sessionId: 'loop-session-1' };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'codex-loop-options-test',
+        nodes: [
+          {
+            id: 'my-loop',
+            provider: 'codex',
+            model: 'gpt-5.5',
+            loop: {
+              prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+              until: 'COMPLETE',
+              max_iterations: 5,
+            },
+          },
+        ],
+        modelReasoningEffort: 'medium',
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.model).toBe('gpt-5.5');
+    expect(optionsArg.assistantConfig).toEqual(
+      expect.objectContaining({ modelReasoningEffort: 'medium' })
+    );
+  });
+
   it('warns user when Codex node has Claude-only options (effort)', async () => {
     mockGetAgentProviderDag.mockImplementation(() => ({
       sendQuery: mockSendQueryDag,
