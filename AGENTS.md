@@ -6,9 +6,11 @@ Keep changes to Archon platform source rare and deliberate.
 
 There are two separate repositories. Do not mix them.
 
-- Platform source: `/Users/kenaku/dev/archon` locally, `/opt/archon` on the server.
+- Platform source: the local `archon` checkout on a developer machine,
+  `/opt/archon` on the server.
   GitHub: `adaptyteam/archon`.
-- Workflow/runtime source: `/Users/kenaku/adapty/archon-workflows` locally, `/srv/archon-data` on the server.
+- Workflow/runtime source: the local `archon-workflows` checkout on a developer
+  machine, `/srv/archon-data` on the server.
   GitHub: `adaptyteam/archon-workflows`.
 
 The server mounts `/srv/archon-data` into the Archon container as `/.archon`.
