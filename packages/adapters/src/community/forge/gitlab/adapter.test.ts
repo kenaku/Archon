@@ -174,6 +174,7 @@ function createMergeRequestPayload(overrides?: {
   projectPath?: string;
   iid?: number;
   projectWebUrl?: string;
+  targetBranch?: string;
   oldrev?: string | null;
   lastCommitId?: string | null;
 }): string {
@@ -196,7 +197,7 @@ function createMergeRequestPayload(overrides?: {
       description: 'Test MR description',
       state: overrides?.state ?? 'opened',
       source_branch: 'feature',
-      target_branch: 'main',
+      target_branch: overrides?.targetBranch ?? 'master',
       source_project_id: 1,
       target_project_id: 1,
       merge_status: 'can_be_merged',
@@ -466,7 +467,7 @@ describe('GitLabAdapter', () => {
         description: null,
         state: 'opened',
         source_branch: 'feature',
-        target_branch: 'main',
+        target_branch: 'master',
         source_project_id: 1,
         target_project_id: 1,
         merge_status: 'can_be_merged',
@@ -507,6 +508,29 @@ describe('GitLabAdapter', () => {
           })
         )
       ).toBe(true);
+    });
+
+    test('skips lifecycle workflow for non-master target branches', () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      const adapter = createAdapter();
+      const shouldTrigger = (
+        adapter as unknown as {
+          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+        }
+      ).shouldTriggerMergeRequestLifecycleWorkflow;
+
+      expect(
+        shouldTrigger.call(
+          adapter,
+          buildEvent({
+            object_attributes: {
+              ...buildEvent().object_attributes,
+              action: 'open',
+              target_branch: 'develop',
+            },
+          })
+        )
+      ).toBe(false);
     });
 
     test('runs open and reopen events', () => {
@@ -585,6 +609,19 @@ describe('GitLabAdapter', () => {
         expect.any(Array),
         expect.anything()
       );
+    });
+
+    test('does not dispatch lifecycle workflow for non-master target branches', async () => {
+      process.env.GITLAB_MR_LIFECYCLE_WORKFLOW = 'mr-intake-classifier';
+      const adapter = createAdapter();
+
+      await adapter.handleWebhook(
+        createMergeRequestPayload({ action: 'open', iid: 7, targetBranch: 'develop' }),
+        'test-secret'
+      );
+
+      expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
+      expect(mockHandleMessage).not.toHaveBeenCalled();
     });
   });
 

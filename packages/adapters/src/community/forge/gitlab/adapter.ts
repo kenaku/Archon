@@ -47,6 +47,7 @@ const MAX_LENGTH = 65000; // Practical limit for GitLab notes
 
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
+const MR_LIFECYCLE_TARGET_BRANCH = 'master';
 
 export class GitLabAdapter implements IPlatformAdapter {
   private readonly gitlabUrl: string;
@@ -624,6 +625,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
     const workflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
     if (!workflowName) return false;
     if (event.object_attributes.state !== 'opened') return false;
+    if (event.object_attributes.target_branch !== MR_LIFECYCLE_TARGET_BRANCH) return false;
 
     const action = event.object_attributes.action;
     if (action === 'open' || action === 'reopen') return true;
