@@ -17,6 +17,8 @@ import {
   ConversationLockManager,
 } from '@archon/core';
 import { getArchonWorkspacesPath, getCommandFolderSearchPaths, createLogger } from '@archon/paths';
+import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import {
   syncRepository,
   addSafeDirectory,
@@ -27,6 +29,7 @@ import {
 } from '@archon/git';
 import * as db from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
+import { loadConfig } from '@archon/core/config';
 import { parseAllowedUsers, isGitLabUserAuthorized, verifyWebhookToken } from './auth';
 import { splitIntoParagraphChunks } from '../../../utils/message-splitting';
 import type {
@@ -621,7 +624,9 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
     return current !== previous;
   }
 
-  private shouldTriggerMergeRequestLifecycleWorkflow(event: GitLabMergeRequestEvent): boolean {
+  private shouldTriggerLegacyMergeRequestLifecycleWorkflow(
+    event: GitLabMergeRequestEvent
+  ): boolean {
     const workflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
     if (!workflowName) return false;
     if (event.object_attributes.state !== 'opened') return false;
@@ -634,18 +639,83 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
     return false;
   }
 
+  private shouldConsiderWorkflowTriggerMergeRequest(event: GitLabMergeRequestEvent): boolean {
+    if (event.object_attributes.state !== 'opened') return false;
+    return event.object_attributes.action === 'open';
+  }
+
+  private workflowMatchesGitLabMergeRequestTrigger(
+    workflow: WorkflowDefinition,
+    event: GitLabMergeRequestEvent,
+    projectPath: string
+  ): boolean {
+    // Temporary local subset of upstream #998 (`triggers:` in workflow YAML).
+    // When upstream lands trigger support, delete this matcher and use the
+    // upstream trigger resolver so Adapty does not carry a parallel dialect.
+    const trigger = workflow.triggers?.gitlab?.merge_request;
+    if (!trigger) return false;
+
+    const eventAction = event.object_attributes.action;
+    const actions = new Set<string>();
+    if (trigger.action) actions.add(trigger.action);
+    for (const action of trigger.actions ?? []) actions.add(action);
+    if (actions.size === 0 || !actions.has(eventAction)) return false;
+
+    if (trigger.target_branch && trigger.target_branch !== event.object_attributes.target_branch) {
+      return false;
+    }
+
+    const projects = Array.isArray(trigger.project)
+      ? trigger.project
+      : trigger.project
+        ? [trigger.project]
+        : [];
+    if (projects.length > 0 && !projects.includes(projectPath)) return false;
+
+    return true;
+  }
+
+  private async findTriggeredMergeRequestWorkflow(
+    repoPath: string,
+    event: GitLabMergeRequestEvent,
+    projectPath: string
+  ): Promise<string | undefined> {
+    const discovery = await discoverWorkflowsWithConfig(repoPath, loadConfig);
+    if (discovery.errors.length > 0) {
+      getLog().warn(
+        { projectPath, errors: discovery.errors.slice(0, 10) },
+        'gitlab.mr_lifecycle_workflow_discovery_errors'
+      );
+    }
+
+    const matches = discovery.workflows
+      .map(entry => entry.workflow)
+      .filter(workflow =>
+        this.workflowMatchesGitLabMergeRequestTrigger(workflow, event, projectPath)
+      );
+
+    if (matches.length > 1) {
+      getLog().warn(
+        { projectPath, workflowNames: matches.map(workflow => workflow.name) },
+        'gitlab.mr_lifecycle_multiple_workflow_triggers'
+      );
+    }
+
+    return matches[0]?.name;
+  }
+
   private async handleMergeRequestLifecycleWorkflow(
     event: GitLabMergeRequestEvent,
     parsed: NonNullable<ReturnType<GitLabAdapter['parseEvent']>>
   ): Promise<void> {
-    const workflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
-    if (!workflowName) return;
+    const legacyWorkflowName = process.env.GITLAB_MR_LIFECYCLE_WORKFLOW?.trim();
 
     const action = event.object_attributes.action;
-    const shouldRun = this.shouldTriggerMergeRequestLifecycleWorkflow(event);
+    const shouldCheckTriggers = this.shouldConsiderWorkflowTriggerMergeRequest(event);
+    const shouldRunLegacy = this.shouldTriggerLegacyMergeRequestLifecycleWorkflow(event);
     const { projectPath, iid } = parsed;
 
-    if (!shouldRun) {
+    if (!shouldCheckTriggers && !shouldRunLegacy) {
       getLog().debug({ projectPath, iid, action }, 'gitlab.mr_lifecycle_workflow_skipped');
       return;
     }
@@ -658,12 +728,13 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         projectPath,
         iid,
         action,
-        workflowName,
+        legacyWorkflowName,
       },
       'gitlab.mr_lifecycle_workflow_received'
     );
 
     await this.lockManager.acquireLock(conversationId, async () => {
+      let workflowName: string | undefined;
       try {
         const {
           codebase,
@@ -680,6 +751,18 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
 
         if (isNewCodebase) {
           await this.autoDetectAndLoadCommands(repoPath, codebase.id);
+        }
+
+        const triggeredWorkflowName = shouldCheckTriggers
+          ? await this.findTriggeredMergeRequestWorkflow(repoPath, event, projectPath)
+          : undefined;
+        workflowName = triggeredWorkflowName ?? (shouldRunLegacy ? legacyWorkflowName : undefined);
+        if (!workflowName) {
+          getLog().debug(
+            { projectPath, iid, action },
+            'gitlab.mr_lifecycle_no_matching_workflow_trigger'
+          );
+          return;
         }
 
         getLog().info(

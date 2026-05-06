@@ -50,6 +50,36 @@ export const workflowWorktreePolicySchema = z.object({
 export type WorkflowWorktreePolicy = z.infer<typeof workflowWorktreePolicySchema>;
 
 // ---------------------------------------------------------------------------
+// Workflow-level trigger metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * Temporary local subset of upstream issue #998 (`triggers:` in workflow YAML).
+ *
+ * Keep this intentionally narrow until upstream lands its trigger model. When
+ * we update from upstream, drop this shim and migrate Adapty workflows to the
+ * upstream schema/loader/adapter contract instead of growing a parallel dialect.
+ *
+ * Upstream reference: https://github.com/coleam00/Archon/issues/998
+ */
+export const workflowGitLabMergeRequestTriggerSchema = z.object({
+  project: z.union([z.string().min(1), z.array(z.string().min(1)).nonempty()]).optional(),
+  actions: z.array(z.string().min(1)).nonempty().optional(),
+  action: z.string().min(1).optional(),
+  target_branch: z.string().min(1).optional(),
+});
+
+export const workflowTriggersSchema = z.object({
+  gitlab: z
+    .object({
+      merge_request: workflowGitLabMergeRequestTriggerSchema.optional(),
+    })
+    .optional(),
+});
+
+export type WorkflowTriggers = z.infer<typeof workflowTriggersSchema>;
+
+// ---------------------------------------------------------------------------
 // WorkflowBase — common fields shared by all workflow types
 // ---------------------------------------------------------------------------
 
@@ -76,6 +106,7 @@ export const workflowBaseSchema = z.object({
    */
   mutates_checkout: z.boolean().optional(),
   tags: z.array(z.string().min(1)).optional(),
+  triggers: workflowTriggersSchema.optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;

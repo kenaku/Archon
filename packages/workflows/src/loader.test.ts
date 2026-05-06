@@ -195,6 +195,24 @@ describe('Workflow Loader', () => {
       expect(result.workflows[0].workflow.mutates_checkout).toBe(false);
     });
 
+    it('should parse temporary GitLab merge_request trigger metadata', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: gitlab-trigger-smoke\ndescription: smoke test\ntriggers:\n  gitlab:\n    merge_request:\n      project: adapty/adapty-dashboard-api\n      actions: [open]\n      target_branch: master\nnodes:\n  - id: n\n    prompt: p\n`;
+      await writeFile(join(workflowDir, 'test.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const workflow = result.workflows.find(item => item.workflow.name === 'gitlab-trigger-smoke');
+      expect(workflow?.workflow.triggers).toEqual({
+        gitlab: {
+          merge_request: {
+            project: 'adapty/adapty-dashboard-api',
+            actions: ['open'],
+            target_branch: 'master',
+          },
+        },
+      });
+    });
+
     it('should parse mutates_checkout: true correctly', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });

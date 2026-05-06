@@ -56,6 +56,14 @@ mock.module('@archon/core/db/codebases', () => ({
   updateCodebase: mockUpdateCodebase,
 }));
 
+const mockDiscoverWorkflowsWithConfig = mock(async () => ({ workflows: [], errors: [] }));
+mock.module('@archon/workflows/workflow-discovery', () => ({
+  discoverWorkflowsWithConfig: mockDiscoverWorkflowsWithConfig,
+}));
+mock.module('@archon/core/config', () => ({
+  loadConfig: mock(async () => ({})),
+}));
+
 // Mock @archon/core
 const mockHandleMessage = mock(async () => undefined);
 const mockOnConversationClosed = mock(async () => undefined);
@@ -233,6 +241,8 @@ describe('GitLabAdapter', () => {
     mockUpdateCodebaseCommands.mockResolvedValue(undefined);
     mockUpdateCodebase.mockClear();
     mockUpdateCodebase.mockResolvedValue(undefined);
+    mockDiscoverWorkflowsWithConfig.mockClear();
+    mockDiscoverWorkflowsWithConfig.mockResolvedValue({ workflows: [], errors: [] });
     mockExecFileAsync.mockClear();
     mockExecFileAsync.mockResolvedValue({ stdout: '', stderr: '' });
     mockFetch.mockClear();
@@ -480,9 +490,9 @@ describe('GitLabAdapter', () => {
       const adapter = createAdapter();
       const shouldTrigger = (
         adapter as unknown as {
-          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+          shouldTriggerLegacyMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
         }
-      ).shouldTriggerMergeRequestLifecycleWorkflow;
+      ).shouldTriggerLegacyMergeRequestLifecycleWorkflow;
 
       expect(shouldTrigger.call(adapter, buildEvent())).toBe(false);
     });
@@ -492,9 +502,9 @@ describe('GitLabAdapter', () => {
       const adapter = createAdapter();
       const shouldTrigger = (
         adapter as unknown as {
-          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+          shouldTriggerLegacyMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
         }
-      ).shouldTriggerMergeRequestLifecycleWorkflow;
+      ).shouldTriggerLegacyMergeRequestLifecycleWorkflow;
 
       expect(
         shouldTrigger.call(
@@ -515,9 +525,9 @@ describe('GitLabAdapter', () => {
       const adapter = createAdapter();
       const shouldTrigger = (
         adapter as unknown as {
-          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+          shouldTriggerLegacyMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
         }
-      ).shouldTriggerMergeRequestLifecycleWorkflow;
+      ).shouldTriggerLegacyMergeRequestLifecycleWorkflow;
 
       expect(
         shouldTrigger.call(
@@ -538,9 +548,9 @@ describe('GitLabAdapter', () => {
       const adapter = createAdapter();
       const shouldTrigger = (
         adapter as unknown as {
-          shouldTriggerMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
+          shouldTriggerLegacyMergeRequestLifecycleWorkflow: (event: unknown) => boolean;
         }
-      ).shouldTriggerMergeRequestLifecycleWorkflow;
+      ).shouldTriggerLegacyMergeRequestLifecycleWorkflow;
 
       expect(
         shouldTrigger.call(
@@ -609,6 +619,120 @@ describe('GitLabAdapter', () => {
         expect.any(Array),
         expect.anything()
       );
+    });
+
+    test('dispatches workflow selected by GitLab merge_request trigger metadata', async () => {
+      mockDiscoverWorkflowsWithConfig.mockResolvedValue({
+        workflows: [
+          {
+            source: 'global',
+            workflow: {
+              name: 'gitlab-trigger-smoke',
+              description: 'test workflow trigger',
+              triggers: {
+                gitlab: {
+                  merge_request: {
+                    project: 'mygroup/myproject',
+                    actions: ['open'],
+                    target_branch: 'master',
+                  },
+                },
+              },
+              nodes: [{ id: 'echo', bash: 'echo ok' }],
+            },
+          },
+        ],
+        errors: [],
+      });
+      mockFindCodebaseByRepoUrl.mockResolvedValue({
+        id: 'codebase-1',
+        name: 'mygroup/myproject',
+        default_cwd: process.cwd(),
+      });
+      mockGetOrCreateConversation.mockResolvedValue({
+        id: 'conversation-1',
+        platform_type: 'gitlab',
+        platform_conversation_id: 'mygroup/myproject!7',
+        codebase_id: null,
+        cwd: null,
+        isolation_env_id: null,
+        ai_assistant_type: 'claude',
+        title: null,
+        hidden: false,
+        deleted_at: null,
+        last_activity_at: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+      mockUpdateConversation.mockResolvedValue(undefined);
+      const adapter = createAdapter();
+
+      await adapter.handleWebhook(
+        createMergeRequestPayload({ action: 'open', iid: 7 }),
+        'test-secret'
+      );
+
+      expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledWith(
+        process.cwd(),
+        expect.any(Function)
+      );
+      expect(mockHandleMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sendMessage: expect.any(Function),
+          getPlatformType: expect.any(Function),
+        }),
+        'mygroup/myproject!7',
+        '/workflow run gitlab-trigger-smoke https://gitlab.example.com/mygroup/myproject/-/merge_requests/7',
+        {
+          isolationHints: {
+            workflowType: 'pr',
+            workflowId: '7',
+          },
+        }
+      );
+    });
+
+    test('does not dispatch trigger metadata workflows for reopen or update yet', async () => {
+      mockDiscoverWorkflowsWithConfig.mockResolvedValue({
+        workflows: [
+          {
+            source: 'global',
+            workflow: {
+              name: 'gitlab-trigger-smoke',
+              description: 'test workflow trigger',
+              triggers: {
+                gitlab: {
+                  merge_request: {
+                    project: 'mygroup/myproject',
+                    actions: ['open'],
+                    target_branch: 'master',
+                  },
+                },
+              },
+              nodes: [{ id: 'echo', bash: 'echo ok' }],
+            },
+          },
+        ],
+        errors: [],
+      });
+      const adapter = createAdapter();
+
+      await adapter.handleWebhook(
+        createMergeRequestPayload({ action: 'reopen', iid: 7 }),
+        'test-secret'
+      );
+      await adapter.handleWebhook(
+        createMergeRequestPayload({
+          action: 'update',
+          iid: 7,
+          oldrev: 'old-sha',
+          lastCommitId: 'new-sha',
+        }),
+        'test-secret'
+      );
+
+      expect(mockDiscoverWorkflowsWithConfig).not.toHaveBeenCalled();
+      expect(mockHandleMessage).not.toHaveBeenCalled();
     });
 
     test('does not dispatch lifecycle workflow for non-master target branches', async () => {

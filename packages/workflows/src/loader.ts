@@ -11,7 +11,11 @@ import {
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
 } from './schemas/dag-node';
-import { modelReasoningEffortSchema, webSearchModeSchema } from './schemas/workflow';
+import {
+  modelReasoningEffortSchema,
+  webSearchModeSchema,
+  workflowTriggersSchema,
+} from './schemas/workflow';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { z } from '@hono/zod-openapi';
 
@@ -424,6 +428,18 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.tags }, 'invalid_tags_block_ignored');
     }
 
+    // Temporary local subset of upstream #998 (`triggers:` in workflow YAML).
+    // Drop this parser once upstream lands workflow triggers, then migrate
+    // Adapty YAML to the upstream field shape instead of preserving this shim.
+    const triggersResult = workflowTriggersSchema.safeParse(raw.triggers);
+    const triggers = triggersResult.success ? triggersResult.data : undefined;
+    if (raw.triggers !== undefined && !triggersResult.success) {
+      getLog().warn(
+        { filename, value: raw.triggers, issues: triggersResult.error.issues },
+        'invalid_workflow_triggers_block_ignored'
+      );
+    }
+
     return {
       workflow: {
         name: raw.name,
@@ -438,6 +454,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         nodes: dagNodes,
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
+        ...(triggers !== undefined ? { triggers } : {}),
       },
       error: null,
     };
