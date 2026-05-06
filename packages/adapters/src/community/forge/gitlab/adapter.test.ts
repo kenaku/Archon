@@ -183,6 +183,9 @@ function createMergeRequestPayload(overrides?: {
   iid?: number;
   projectWebUrl?: string;
   targetBranch?: string;
+  sourceBranch?: string;
+  sourceProjectId?: number;
+  targetProjectId?: number;
   oldrev?: string | null;
   lastCommitId?: string | null;
 }): string {
@@ -204,10 +207,10 @@ function createMergeRequestPayload(overrides?: {
       title: 'Test MR',
       description: 'Test MR description',
       state: overrides?.state ?? 'opened',
-      source_branch: 'feature',
+      source_branch: overrides?.sourceBranch ?? 'feature',
       target_branch: overrides?.targetBranch ?? 'master',
-      source_project_id: 1,
-      target_project_id: 1,
+      source_project_id: overrides?.sourceProjectId ?? 1,
+      target_project_id: overrides?.targetProjectId ?? 1,
       merge_status: 'can_be_merged',
       oldrev: overrides?.oldrev,
       last_commit:
@@ -611,6 +614,10 @@ describe('GitLabAdapter', () => {
           isolationHints: {
             workflowType: 'pr',
             workflowId: '7',
+            prBranch: 'feature',
+            prSha: undefined,
+            isForkPR: false,
+            baseBranch: 'master',
           },
         }
       );
@@ -668,7 +675,12 @@ describe('GitLabAdapter', () => {
       const adapter = createAdapter();
 
       await adapter.handleWebhook(
-        createMergeRequestPayload({ action: 'open', iid: 7 }),
+        createMergeRequestPayload({
+          action: 'open',
+          iid: 7,
+          sourceBranch: 'feature/gitlab-review',
+          lastCommitId: 'abc123def456',
+        }),
         'test-secret'
       );
 
@@ -687,6 +699,10 @@ describe('GitLabAdapter', () => {
           isolationHints: {
             workflowType: 'pr',
             workflowId: '7',
+            prBranch: 'feature/gitlab-review',
+            prSha: 'abc123def456',
+            isForkPR: false,
+            baseBranch: 'master',
           },
         }
       );

@@ -704,6 +704,21 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
     return matches[0]?.name;
   }
 
+  private buildMergeRequestIsolationHints(event: GitLabMergeRequestEvent): IsolationHints {
+    const attributes = event.object_attributes;
+    const prSha =
+      attributes.last_commit?.id ?? event.changes?.last_commit?.current?.id ?? undefined;
+
+    return {
+      workflowType: 'pr',
+      workflowId: String(attributes.iid),
+      prBranch: toBranchName(attributes.source_branch),
+      prSha: prSha ?? undefined,
+      isForkPR: attributes.source_project_id !== attributes.target_project_id,
+      baseBranch: toBranchName(attributes.target_branch),
+    };
+  }
+
   private async handleMergeRequestLifecycleWorkflow(
     event: GitLabMergeRequestEvent,
     parsed: NonNullable<ReturnType<GitLabAdapter['parseEvent']>>
@@ -790,10 +805,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
           mrConversationId,
           `/workflow run ${workflowName} ${mrUrl}`,
           {
-            isolationHints: {
-              workflowType: 'pr',
-              workflowId: String(iid),
-            },
+            isolationHints: this.buildMergeRequestIsolationHints(event),
           }
         );
 
